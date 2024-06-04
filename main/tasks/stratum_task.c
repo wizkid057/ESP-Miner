@@ -9,6 +9,7 @@
 #include "work_queue.h"
 #include <esp_sntp.h>
 #include <time.h>
+#include <inttypes.h>
 
 #define PORT CONFIG_STRATUM_PORT
 #define STRATUM_URL CONFIG_STRATUM_URL
@@ -34,6 +35,238 @@ void dns_found_cb(const char * name, const ip_addr_t * ipaddr, void * callback_a
         bDNSInvalid = true;
     }
  }
+
+
+int switch_coinbase_parser_chunk(uint16_t **p, int *chunk, StratumApiV1Message *m, uint16_t **fake_en2) {
+	// The coinbase data in stratum has to be assembled for parsing
+	// coinbase1 + extranonce1 + extranonce2 + coinbase2
+	// We'll do this by just switching our pointer whenever we hit one of these boundaries
+
+	(*chunk)++;
+	if (*chunk == 1) {
+		// setup extranonce2 to just be whatever is at the end of coinb1.
+		// it doesn't matter what it is as long as the len is correct.
+		// we just want that many bytes, and then a terminator again
+		// the miner gets to decide extranonce2, so this can be anything for parsing
+		*fake_en2 = *p - m->extranonce_2_len;
+		
+		// set to extranonce1 string from the pool
+		*p = (uint16_t *)m->extranonce_str;
+	} else if (*chunk == 2) {
+		// extranonce2 (random)
+		*p = *fake_en2;
+	} else if (*chunk == 3) {
+		// final part of the coinbase
+		*p = (uint16_t *)m->mining_notification->coinbase_2;
+	} else {
+		return 0;
+	}
+	return *chunk;
+}
+
+uint64_t coinbase_parser_parse_cbvalue(uint16_t **p, int *chunk, StratumApiV1Message *m, uint16_t **fake_en2) {
+	// extract a 64-bit hex value into a variable
+	uint64_t cbvalue = 0;
+	for (int shift = 0; shift <= 60; shift += 8) {
+		if (!(**p & 0xff)) {
+			if (!switch_coinbase_parser_chunk(p, chunk, m, fake_en2)) {
+				return UINT64_MAX; // or handle the error as needed
+			}
+		}
+		cbvalue += (uint64_t)(hexnibble2bin(**p >> 8) << shift) | (uint64_t)(hexnibble2bin(**p & 0xFF) << (shift + 4));
+		(*p)++;
+	}
+	return cbvalue;
+}
+
+uint64_t coinbase_parser_parse_varint(uint16_t **p, int *chunk, StratumApiV1Message *m, uint16_t **fake_en2) {
+
+	// parse a bitcoin varint in hex into a 64-bit value
+	uint64_t varint = 0;
+	uint8_t first_byte;
+	if (!(**p & 0xff)) {
+		if (!switch_coinbase_parser_chunk(p, chunk, m, fake_en2)) {
+			return UINT64_MAX;
+		}
+	}	
+	
+	first_byte = (hexnibble2bin(**p >> 8)) | (hexnibble2bin(**p & 0xFF) << 4);
+	(*p)++;
+	if (!(first_byte & 0xff)) {
+		if (!switch_coinbase_parser_chunk(p, chunk, m, fake_en2)) {
+			return UINT64_MAX;
+		}
+	}
+
+	if (first_byte < 0xfd) {
+		varint = first_byte;
+	} else if (first_byte == 0xfd) {
+		for (int i = 0; i < 2; i++) {
+			if (!(**p & 0xff)) {
+				if (!switch_coinbase_parser_chunk(p, chunk, m, fake_en2)) {
+					return UINT64_MAX;
+				}
+			}
+			varint |= (((hexnibble2bin(**p >> 8)) | (hexnibble2bin(**p & 0xFF) << 4)) << (i * 8));
+			(*p)++;
+		}
+	} else if (first_byte == 0xfe) {
+		for (int i = 0; i < 4; i++) {
+			if (!(**p & 0xff)) {
+				if (!switch_coinbase_parser_chunk(p, chunk, m, fake_en2)) {
+					return UINT64_MAX;
+				}
+			}
+			varint |= (((hexnibble2bin(**p >> 8)) | (hexnibble2bin(**p & 0xFF) << 4)) << (i * 8));
+			(*p)++;
+		}
+	} else {
+		for (int i = 0; i < 8; i++) {
+			if (!(**p & 0xff)) {
+				if (!switch_coinbase_parser_chunk(p, chunk, m, fake_en2)) {
+					return UINT64_MAX;
+				}
+			}
+			varint |= (((hexnibble2bin(**p >> 8)) | (hexnibble2bin(**p & 0xFF) << 4)) << (i * 8));
+			(*p)++;
+		}
+	}
+	return varint;
+}
+
+void stratum_update_work_stats(StratumApiV1Message *m) {
+
+	// decode the coinbase transaction for cool stats! moar data!
+	// TODO: Do something with this data besides just logging it
+	
+	int chunk = 0;
+	int i,j;
+	unsigned char c;
+	uint16_t *p = (uint16_t *)m->mining_notification->coinbase_1;
+	uint32_t u;
+	uint16_t *fake_en2 = p;
+	uint64_t cbvalue = 0;
+	char cbtext[96];
+	
+	// Some sanity checks, in case mining on non-bitcoin
+	// check for version 1 or 2 txn, with 1 input
+	if (((*p != 0x3130) && (*p != 0x3230)) || (p[4] != 0x3130)) return;
+
+	// Coinbase var-length is always (supposed to be) at index 41
+	// Technically a varint, but the coinbase is consensus limited to 100 bytes, which is never enough to trigger a multi-byte varint
+	// highest should be 0x64
+	p+=41;
+	// poor man's hex to byte.  keep in mind the nibbles are reversed
+	i = ((*p & 0xFF)-0x30)<<4; // we know this nibble will be 0-6
+	i += hexnibble2bin(*p >> 8);
+	p++;
+	
+	if (i > 100) return;
+	
+	ESP_LOGE("coinbase_parser", "Input length: %d bytes", i);
+	
+	// first part of the coinbase is the block height.
+	// this byte should be 03 (0x3330) for several lifetimes.
+	if (*p != 0x3330) return;
+	p++;
+	
+	// next 3 bytes are the current block height
+	u = (hexnibble2bin(*p >> 8) << 0) | (hexnibble2bin(*p & 0xFF) << 4);
+	p++;
+	u |= (hexnibble2bin(*p >> 8) << 8) | (hexnibble2bin(*p & 0xFF) << 12);
+	p++;
+	u |= (hexnibble2bin(*p >> 8) << 16) | (hexnibble2bin(*p & 0xFF) << 20);
+	p++;
+	i-=4;
+	
+	ESP_LOGE("coinbase_parser", "Block height: %" PRIu32, u);
+	
+	if (i) {
+		// data remains in the coinbase
+		// let's parse out the ascii printable characters to get a text
+		// string to show the user about which pool their work is coming from
+		j = 0;
+		while ((i > 0) && (j< 95)) {
+			if (!(*p & 0xff)) {	if (!switch_coinbase_parser_chunk(&p, &chunk, m, &fake_en2)) { return; } }
+			c = (hexnibble2bin(*p >> 8)) | (hexnibble2bin(*p & 0xFF) << 4);
+			p++;
+			if ((c >= 32) && (c<=126) && (c != '\n') && (c != '\r')) {
+				cbtext[j] = c;
+			} else {
+				cbtext[j] = '?';
+			}
+			j++;
+			i--;
+		}
+		cbtext[j] = 0;
+		ESP_LOGE("coinbase_parser", "Text: %s", cbtext);
+	} else {
+		// It's not required that the coinbase have additional data
+		ESP_LOGE("coinbase_parser", "Text: (NULL)");
+	}
+
+	// continue parsing
+	// skip 4 bytes for sequence
+	for(i=0;i<4;i++) {
+			if (!(*p & 0xff)) {	if (!switch_coinbase_parser_chunk(&p, &chunk, m, &fake_en2)) { return; } }
+			p++;
+	}
+
+	// parse varint into i for the number of outputs in the coinbase
+	if (!(*p & 0xff)) {	if (!switch_coinbase_parser_chunk(&p, &chunk, m, &fake_en2)) { return; } }
+	c = (hexnibble2bin(*p >> 8)) | (hexnibble2bin(*p & 0xFF) << 4);
+	p++;
+	if (c <= 0xFC) {
+		i = c;
+	} else {
+		if (c == 0xFD) {
+			// 16-bit varint to follow
+			if (!(*p & 0xff)) {	if (!switch_coinbase_parser_chunk(&p, &chunk, m, &fake_en2)) { return; } }
+			i = (hexnibble2bin(*p >> 8) << 0) | (hexnibble2bin(*p & 0xFF) << 4);
+			p++;
+			if (!(*p & 0xff)) {	if (!switch_coinbase_parser_chunk(&p, &chunk, m, &fake_en2)) { return; } }
+			i |= (hexnibble2bin(*p >> 8) << 8) | (hexnibble2bin(*p & 0xFF) << 12);
+			p++;
+		} else {
+			ESP_LOGE("coinbase_parser", "Coinbase appears to have more than 65536 outputs? crazy.");
+			return; // if the coinbase has more than 2^16 outputs just give up. we dont have time for that
+		}
+	}
+	
+	ESP_LOGE("coinbase_parser", "Output count: %d", i);
+	
+	
+	// loop through all of the outputs, add up their values into cbvalue
+	// abort on any issues.
+	for(j=0;j<i;j++) {
+		// add up value of all outputs
+		uint64_t cb_temp = coinbase_parser_parse_cbvalue(&p, &chunk, m, &fake_en2);
+		if (cb_temp == UINT64_MAX) return;
+		
+		cbvalue += cb_temp;
+		
+        // get the varlen from the next byte(s)
+        uint64_t varlen = coinbase_parser_parse_varint(&p, &chunk, m, &fake_en2);
+
+		if (varlen == UINT64_MAX) return;
+		
+        // discard that many bytes. possibly can decode output addresses here, if we really want that info
+		// but this function is probably expensive enough as it is.
+        for (uint64_t k = 0; k < varlen; k++) {
+            if (!(*p & 0xff)) {
+                if (!switch_coinbase_parser_chunk(&p, &chunk, m, &fake_en2)) {
+                    return;
+                }
+            }
+            p++;
+        }	
+	}
+	
+	ESP_LOGE("coinbase_parser", "Output value: %.8f BTC", (double)cbvalue/100000000.0);
+	
+	return;
+
+}
 
 void stratum_task(void * pvParameters)
 {
@@ -148,6 +381,9 @@ void stratum_task(void * pvParameters)
 
                 stratum_api_v1_message.mining_notification->difficulty = SYSTEM_TASK_MODULE.stratum_difficulty;
                 queue_enqueue(&GLOBAL_STATE->stratum_queue, stratum_api_v1_message.mining_notification);
+				
+				stratum_update_work_stats(&stratum_api_v1_message);
+				
             } else if (stratum_api_v1_message.method == MINING_SET_DIFFICULTY) {
                 if (stratum_api_v1_message.new_difficulty != SYSTEM_TASK_MODULE.stratum_difficulty) {
                     SYSTEM_TASK_MODULE.stratum_difficulty = stratum_api_v1_message.new_difficulty;
